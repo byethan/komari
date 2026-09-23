@@ -1,0 +1,215 @@
+name: Publish self-hosted Komari image
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_ref:
+        description: Komari server tag or commit to build
+        required: true
+        default: "1.2.5"
+        type: string
+      frontend_ref:
+        description: byethan/komari-web tag or commit to embed
+        required: true
+        default: "1.2.5"
+        type: string
+      image_tag:
+        description: GHCR image tag to publish
+        required: true
+        default: "1.2.5-byethan.1"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-self-${{ github.ref }}-${{ inputs.image_tag }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  ZIG_VERSION: "0.14.1"
+  ZIG_SHA256: "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
+
+jobs:
+  build-binaries:
+    name: Build Linux binaries
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out selected server source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.server_ref }}
+          path: server
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out selected frontend source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: byethan/komari-web
+          ref: ${{ inputs.frontend_ref }}
+          path: frontend
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build pinned frontend
+        working-directory: frontend
+        run: |
+          set -euxo pipefail
+          npm ci
+          npm run build
+
+      - name: Embed frontend into server source
+        run: |
+          set -euxo pipefail
+          mkdir -p server/web/public/defaultTheme/dist
+          rm -rf server/web/public/defaultTheme/dist/*
+          cp -R frontend/dist/. server/web/public/defaultTheme/dist/
+          cp frontend/komari-theme.json server/web/public/defaultTheme/
+          if [ -f frontend/preview.png ]; then
+            cp frontend/preview.png server/web/public/defaultTheme/
+          fi
+          test -s server/web/public/defaultTheme/dist/index.html
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Verify Go modules and tests
+        working-directory: server
+        run: |
+          set -euxo pipefail
+          go mod verify
+          go test ./...
+          go vet ./...
+
+      - name: Install verified Zig toolchain
+        run: |
+          set -euxo pipefail
+          archive="$RUNNER_TEMP/zig.tar.xz"
+          install_dir="$RUNNER_TEMP/zig"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o "$archive"
+          echo "${ZIG_SHA256}  ${archive}" | sha256sum -c -
+          mkdir -p "$install_dir"
+          tar -xJf "$archive" -C "$install_dir" --strip-components=1
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Build static amd64 and arm64 binaries
+        working-directory: server
+        env:
+          VERSION: ${{ inputs.image_tag }}
+          CGO_ENABLED: "1"
+          GIN_MODE: release
+        run: |
+          set -euxo pipefail
+          version_hash="$(git rev-parse HEAD)"
+          ldflags="-s -w -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${version_hash}"
+
+          GOOS=linux GOARCH=amd64 CC="zig cc -target x86_64-linux-musl" \
+            go build -trimpath -ldflags="$ldflags" -o komari-linux-amd64 .
+
+          GOOS=linux GOARCH=arm64 CC="zig cc -target aarch64-linux-musl" \
+            go build -trimpath -ldflags="$ldflags" -o komari-linux-arm64 .
+
+          file komari-linux-amd64 komari-linux-arm64
+
+      - name: Upload Docker binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: komari-docker-binaries
+          path: |
+            server/komari-linux-amd64
+            server/komari-linux-arm64
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image:
+    name: Publish multi-architecture image
+    needs: build-binaries
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Validate image tag
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "Invalid Docker image tag: $IMAGE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Check out selected server source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.server_ref }}
+          path: server
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record source commit
+        id: source
+        run: echo "sha=$(git -C server rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download Docker binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: komari-docker-binaries
+          path: server
+
+      - name: Verify Docker build inputs
+        run: |
+          set -euxo pipefail
+          test -s server/komari-linux-amd64
+          test -s server/komari-linux-arm64
+          test -f server/Dockerfile
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: server
+          file: server/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.image_tag }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Write build summary
+        run: |
+          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          echo "${REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}@${{ steps.image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
